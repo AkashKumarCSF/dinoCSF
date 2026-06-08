@@ -1,244 +1,72 @@
 import os
-import json
 import numpy as np
-from dataclasses import dataclass
-from typing import Dict, List, Tuple
-import logging
-
+import pandas as pd
+from sklearn.metrics import (
+    confusion_matrix,
+    precision_recall_fscore_support
+)
 import torch
 import torch.nn as nn
 import torch.distributed as dist
-
-from PIL import Image
+from sympy import false
+from tensorboard.plugin_util import experiment_id
+from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader, DistributedSampler
+from torchvision import datasets, transforms
+import timm
 from tqdm import tqdm
 
-from torch.utils.data import Dataset, DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
-from torchvision import datasets, transforms
-from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import f1_score
-
-
-# =========================================================
-# CONFIG
-# =========================================================
-
-@dataclass
-class Config:
-
-    experiment_id = 1
-    dataset_name: str = "CSF"
-    root_dir: str = "/home/administrator/Akash/datasets/CSF/"
-    split_json: str = "/home/administrator/Akash/datasets/split_file_15cls.json"
-    project_dir: str = "/home/administrator/Akash/pycharm_projects/Selfsupervised/dinoCSF/"
-
-    img_size: int = 224
-    batch_size: int = 64
-    lr: float = 1e-4
-    epochs: int = 100
-    num_classes: int = 15
-
-    num_workers: int = 4
-
-
-# =========================================================
-# DDP HELPERS
-# =========================================================
-
+# -------------------------
+# DDP setup
+# -------------------------
 def setup_ddp():
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
     return local_rank
 
 
 def cleanup_ddp():
-    if dist.is_initialized():
-        dist.destroy_process_group()
+    dist.destroy_process_group()
 
 
-def setup_logging(cfg):
-    logging.basicConfig(
-        filename=cfg.project_dir + "logs/Experiment" + str(cfg.experiment_id) + "_training.log",
-        filemode="a",
-        format="%(asctime)s | %(message)s",
-        level=logging.INFO
-    )
-    return logging.getLogger()
+# -------------------------
+# Config
+# -------------------------
+BATCH_SIZE = 128  # per GPU
+LR = 1e-3
+EPOCHS = 100
+NUM_CLASSES = 15
+IMG_SIZE = 224
+DATASET_NAME = "CSF"
+ddp_status = True
+checkpoint_path = "/home/adminuser/PycharmProjects/Selfsupervised/dinoCSF/checkpoints/"
+class_names = ['Artifizielle Zelle', 'Erythrophage', 'Erythrozyt', 'Hämatoidin', 'Hämosiderophage',	'Kernschatten',
+                   'Lymphozyt', 'Mitose', 'Monozyt', 'Plasmazelle', 'Tumor', 'aktivierter Lymphozyt', 'aktivierter Monozyt',
+                   'eosinophiler Granulozyt', 'neutrophiler Granulozyt']
 
-
-def setup_tensorboard():
-    return SummaryWriter(log_dir="runs/")
-
-
-def compute_confusion_matrix(outputs, labels, num_classes):
-    preds = outputs.argmax(1)
-
-    cm = torch.zeros((num_classes, num_classes), device=outputs.device)
-
-    for t, p in zip(labels.view(-1), preds.view(-1)):
-        cm[t.long(), p.long()] += 1
-
-    return cm
-
-def compute_metrics(cm: torch.Tensor):
-
-    cm = cm.cpu().numpy()
-
-    tp = np.diag(cm)
-    fp = cm.sum(axis=0) - tp
-    fn = cm.sum(axis=1) - tp
-    tn = cm.sum() - (tp + fp + fn)
-
-    sensitivity = np.divide(tp, tp + fn, out=np.zeros_like(tp), where=(tp + fn) != 0)
-    specificity = np.divide(tn, tn + fp, out=np.zeros_like(tp), where=(tn + fp) != 0)
-    precision = np.divide(tp, tp + fp, out=np.zeros_like(tp), where=(tp + fp) != 0)
-    recall = sensitivity
-
-    f1 = np.divide(
-        2 * precision * recall,
-        precision + recall,
-        out=np.zeros_like(tp),
-        where=(precision + recall) != 0
-    )
-
-    return {
-        "sensitivity": sensitivity,
-        "specificity": specificity,
-        "f1": f1,
-        "macro_f1": np.mean(f1)
-    }
-
-
-# =========================================================
-# CSF DATASET (PID SPLIT ONLY FOR CSF)
-# =========================================================
-
-class CSFSplitDataset(Dataset):
-    """
-    CSF dataset with PID-based filtering using filename.
-    """
-
-    def __init__(self, root: str, split_pids: set, transform=None):
-        self.transform = transform
-        self.samples: List[Tuple[str, int]] = []
-
-        base = datasets.ImageFolder(root)
-
-        for path, label in base.samples:
-            filename = os.path.basename(path)
-
-            try:
-                pid = int(filename.split("_")[1])
-            except Exception:
-                continue
-
-            if pid in split_pids:
-                self.samples.append((path, label))
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        path, label = self.samples[idx]
-
-        image = Image.open(path).convert("RGB")
-        if self.transform:
-            image = self.transform(image)
-
-        return image, label
-
-
-# =========================================================
-# DATASET FACTORY
-# =========================================================
-
-def load_split_json(path: str):
-    with open(path, "r") as f:
-        split = json.load(f)
-    return {
-        "train": set(split["train"]),
-        "val": set(split["val"]),
-        "test": set(split["test"]),
-    }
-
-
-def build_datasets(cfg: Config, transform):
-    """
-    Only CSF uses JSON PID splitting.
-    Other datasets fall back to ImageFolder default behavior.
-    """
-
-    if cfg.dataset_name.upper() == "CSF":
-        splits = load_split_json(cfg.split_json)
-
-        train_ds = CSFSplitDataset(cfg.root_dir, splits["train"], transform)
-        val_ds = CSFSplitDataset(cfg.root_dir, splits["val"], transform)
-        test_ds = CSFSplitDataset(cfg.root_dir, splits["test"], transform)
-
-        return train_ds, val_ds, test_ds
-
+best_model_path = ""
+# -------------------------
+# Train
+# -------------------------
+def main():
+    if ddp_status:
+        local_rank = setup_ddp()
+        device = torch.device(f"cuda:{local_rank}")
     else:
-        # Generic fallback (no PID split)
-        base = datasets.ImageFolder(cfg.root_dir, transform=transform)
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        n = len(base)
-        train_len = int(0.8 * n)
-        val_len = int(0.1 * n)
+    #world_size = dist.get_world_size()
+    rank = dist.get_rank()
 
-        train_ds, val_ds, test_ds = torch.utils.data.random_split(
-            base,
-            [train_len, val_len, n - train_len - val_len]
-        )
+    DATASET_ROOT = "/home/adminuser/backup/Neuropathological_Data/projects/Akash/CSF_classification/raw_data/zenodo/"
+    SPLIT_JSON = "data/split_file.json"
+    ODS_FILE = "data/supplementary_table_73.ods"
 
-        return train_ds, val_ds, test_ds
-
-
-# =========================================================
-# DATALOADERS
-# =========================================================
-
-def build_loaders(cfg: Config, train_ds, val_ds, test_ds):
-
-    train_sampler = DistributedSampler(train_ds, shuffle=True)
-    val_sampler = DistributedSampler(val_ds, shuffle=False)
-    test_sampler = DistributedSampler(test_ds, shuffle=False)
-
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.batch_size,
-        sampler=train_sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=True
-    )
-
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=cfg.batch_size,
-        sampler=val_sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=True
-    )
-
-    test_loader = DataLoader(
-        test_ds,
-        batch_size=cfg.batch_size,
-        sampler=test_sampler,
-        num_workers=cfg.num_workers,
-        pin_memory=True
-    )
-
-    return train_loader, val_loader, test_loader, train_sampler
-
-
-# =========================================================
-# MODEL SETUP
-# =========================================================
-
-def build_model(cfg: Config, device):
+    # -------------------------
+    # Frozen DINOv2 backbone
+    # -------------------------
     backbone = torch.hub.load(
         "facebookresearch/dinov2",
         "dinov2_vitb14"
@@ -248,125 +76,22 @@ def build_model(cfg: Config, device):
     for p in backbone.parameters():
         p.requires_grad = False
 
-    classifier = nn.Sequential(
-        nn.LayerNorm(768),
-        nn.Linear(768, 512),
-        nn.GELU(),
-        nn.Dropout(0.3),
-        nn.Linear(512, 256),
-        nn.GELU(),
-        nn.Linear(256, 15)
-    ).to(device)
 
-    classifier = nn.parallel.DistributedDataParallel(
+    # -------------------------
+    # Classifier head
+    # -------------------------
+    classifier = nn.Linear(768, NUM_CLASSES).to(device)
+    classifier = torch.nn.parallel.DistributedDataParallel(
         classifier,
-        device_ids=[int(os.environ.get("LOCAL_RANK", 0))]
+        device_ids=[local_rank]
     )
 
-    return backbone, classifier
-
-
-# =========================================================
-# TRAIN / EVAL UTILITIES
-# =========================================================
-
-def extract_features(backbone, x):
-    with torch.no_grad():
-        feats = backbone.forward_features(x)
-        return feats["x_norm_clstoken"]
-
-
-def train_one_epoch(backbone, classifier, loader, sampler, optimizer, criterion, device, epoch, rank):
-
-    classifier.train()
-    sampler.set_epoch(epoch)
-
-    total_loss = 0.0
-
-    for imgs, labels in tqdm(loader, disable=(rank != 0)):
-
-        imgs = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        feats = extract_features(backbone, imgs)
-        outputs = classifier(feats)
-
-        loss = criterion(outputs, labels)
-
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        total_loss += loss.item()
-
-    return total_loss / len(loader)
-
-
-@torch.no_grad()
-def evaluate(backbone, classifier, loader, criterion, device, num_classes):
-
-    classifier.eval()
-
-    correct = torch.tensor(0.0, device=device)
-    total = torch.tensor(0.0, device=device)
-    loss_sum = torch.tensor(0.0, device=device)
-
-    cm = torch.zeros((num_classes, num_classes), device=device)
-
-    for imgs, labels in loader:
-
-        imgs = imgs.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-
-        feats = extract_features(backbone, imgs)
-        outputs = classifier(feats)
-
-        loss = criterion(outputs, labels)
-
-        preds = outputs.argmax(1)
-
-        correct += (preds == labels).sum()
-        total += labels.size(0)
-        loss_sum += loss.detach()
-
-        # update confusion matrix
-        for t, p in zip(labels.view(-1), preds.view(-1)):
-            cm[t.long(), p.long()] += 1
-
-    dist.all_reduce(correct)
-    dist.all_reduce(total)
-    dist.all_reduce(loss_sum)
-    dist.all_reduce(cm)
-
-    acc = correct.item() / total.item()
-    avg_loss = loss_sum.item() / dist.get_world_size()
-
-    metrics = compute_metrics(cm)
-
-    return acc, avg_loss, cm, metrics
-
-
-# =========================================================
-# MAIN
-# =========================================================
-
-def main():
-
-    cfg = Config()
-
-    local_rank = setup_ddp()
-    device = torch.device(f"cuda:{local_rank}")
-
-    rank = dist.get_rank()
-    logger = setup_logging(cfg)
-
-    writer = setup_tensorboard() if rank == 0 else None
 
     # -------------------------
-    # Transforms
+    # Data
     # -------------------------
     transform = transforms.Compose([
-        transforms.Resize((cfg.img_size, cfg.img_size)),
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(
             mean=(0.485, 0.456, 0.406),
@@ -374,108 +99,308 @@ def main():
         )
     ])
 
-    # -------------------------
-    # Dataset
-    # -------------------------
-    train_ds, val_ds, test_ds = build_datasets(cfg, transform)
+    if DATASET_NAME == "CSF":
 
-    # -------------------------
-    # Loader
-    # -------------------------
-    train_loader, val_loader, test_loader, train_sampler = build_loaders(
-        cfg, train_ds, val_ds, test_ds
+        from csf_dataset import build_csf_datasets
+
+        train_ds, val_ds, test_ds = build_csf_datasets(
+            data_root=DATASET_ROOT,
+            split_json_path=SPLIT_JSON,
+            ods_file_path=ODS_FILE,
+            transform=transform
+        )
+
+    else:
+
+        train_ds = datasets.ImageFolder("CSF_dataset/train", transform=transform)
+        val_ds = datasets.ImageFolder("CSF_dataset/val", transform=transform)
+        test_ds = datasets.ImageFolder("CSF_dataset/test", transform=transform)
+
+    train_sampler = DistributedSampler(train_ds, shuffle=True)
+    val_sampler   = DistributedSampler(val_ds, shuffle=False)
+    test_sampler  = DistributedSampler(test_ds, shuffle=False)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        sampler=train_sampler,
+        num_workers=4,
+        pin_memory=True
     )
 
-    # -------------------------
-    # Model
-    # -------------------------
-    backbone, classifier = build_model(cfg, device)
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        sampler=val_sampler,
+        num_workers=4,
+        pin_memory=True
+    )
+
+    test_loader = DataLoader(
+        test_ds,
+        batch_size=BATCH_SIZE,
+        sampler=test_sampler,
+        num_workers=4,
+        pin_memory=True
+    )
+
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(classifier.parameters(), lr=cfg.lr)
+    optimizer = torch.optim.AdamW(
+        classifier.parameters(),
+        lr=LR,
+        weight_decay=1e-4
+    )
 
-    best_acc = 0.0
+
+    # -------------------------
+    # Feature extraction
+    # -------------------------
+    def extract_features(x):
+        with torch.no_grad():
+            feats = backbone.forward_features(x)
+            return feats["x_norm_clstoken"]
+
+
+    # -------------------------
+    # Train loop
+    # -------------------------
+    def train_one_epoch(epoch):
+        classifier.train()
+        train_sampler.set_epoch(epoch)
+
+        total_loss = 0
+
+        for imgs, labels in tqdm(train_loader, disable=(rank != 0)):
+            imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            feats = extract_features(imgs)
+            outputs = classifier(feats)
+
+            loss = criterion(outputs, labels)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / len(train_loader)
+
+
+    # -------------------------
+    # Eval (DDP reduced)
+    # -------------------------
+    @torch.no_grad()
+    def evaluate(loader):
+        classifier.eval()
+
+        correct = torch.tensor(0.0, device=device)
+        total = torch.tensor(0.0, device=device)
+        loss_sum = torch.tensor(0.0, device=device)
+
+        for imgs, labels in loader:
+            imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            feats = extract_features(imgs)
+            outputs = classifier(feats)
+
+            loss = criterion(outputs, labels)
+
+            preds = outputs.argmax(1)
+            correct += (preds == labels).sum()
+            total += labels.size(0)
+            loss_sum += loss.item()
+
+        # ---- sync across GPUs ----
+        dist.all_reduce(correct)
+        dist.all_reduce(total)
+        dist.all_reduce(loss_sum)
+
+        acc = correct.item() / total.item()
+        avg_loss = loss_sum.item() / dist.get_world_size()
+
+        return acc, avg_loss
+
+    @torch.no_grad()
+    def evaluate_test_metrics(loader):
+        classifier.eval()
+
+        local_preds = []
+        local_labels = []
+
+        correct = torch.tensor(0.0, device=device)
+        total = torch.tensor(0.0, device=device)
+        loss_sum = torch.tensor(0.0, device=device)
+
+        for imgs, labels in loader:
+            imgs = imgs.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True)
+
+            feats = extract_features(imgs)
+            outputs = classifier(feats)
+
+            loss = criterion(outputs, labels)
+
+            preds = outputs.argmax(dim=1)
+
+            correct += (preds == labels).sum()
+            total += labels.size(0)
+            loss_sum += loss.item()
+
+            local_preds.append(preds)
+            local_labels.append(labels)
+
+        # --------------------
+        # Accuracy/Loss
+        # --------------------
+        dist.all_reduce(correct)
+        dist.all_reduce(total)
+        dist.all_reduce(loss_sum)
+
+        acc = correct.item() / total.item()
+        avg_loss = loss_sum.item() / dist.get_world_size()
+
+        # --------------------
+        # Gather predictions
+        # --------------------
+        local_preds = torch.cat(local_preds)
+        local_labels = torch.cat(local_labels)
+
+        gathered_preds = [torch.zeros_like(local_preds)
+                          for _ in range(dist.get_world_size())]
+
+        gathered_labels = [torch.zeros_like(local_labels)
+                           for _ in range(dist.get_world_size())]
+
+        dist.all_gather(gathered_preds, local_preds)
+        dist.all_gather(gathered_labels, local_labels)
+
+        if rank == 0:
+            y_pred = torch.cat(gathered_preds).cpu().numpy()
+            y_true = torch.cat(gathered_labels).cpu().numpy()
+
+            return acc, avg_loss, y_true, y_pred
+
+        return acc, avg_loss, None, None
 
     # -------------------------
     # Training loop
     # -------------------------
-    for epoch in range(cfg.epochs):
 
-        train_loss = train_one_epoch(
-            backbone, classifier,
-            train_loader,
-            train_sampler,
-            optimizer,
-            criterion,
-            device,
-            epoch,
-            rank
-        )
+    best_acc = 0.0
+    best_model_path = checkpoint_path + "best_model.pth"
+    # Create TensorBoard writer only on rank 0
+    if rank == 0:
+        os.makedirs("tensorboard_logs", exist_ok=True)
+        writer = SummaryWriter(log_dir="tensorboard_logs")
 
-        val_acc, val_loss, cm, metrics = evaluate(
-            backbone,
-            classifier,
-            val_loader,
-            criterion,
-            device,
-            cfg.num_classes
-        )
+    for epoch in range(EPOCHS):
+        train_loss = train_one_epoch(epoch)
+        val_acc, val_loss = evaluate(val_loader)
 
         if rank == 0:
+            print(f"\nEpoch {epoch}")
+            print(f"Train loss: {train_loss:.4f}")
+            print(f"Val loss: {val_loss:.4f}, Val acc: {val_acc:.4f}")
 
-            log_msg = (
-                f"Epoch {epoch} | "
-                f"TrainLoss={train_loss:.4f} | "
-                f"ValLoss={val_loss:.4f} | "
-                f"ValAcc={val_acc:.4f} | "
-                f"MacroF1={metrics['macro_f1']:.4f}"
-            )
+            # TensorBoard logging
+            writer.add_scalar("Loss/Train", train_loss, epoch)
+            writer.add_scalar("Loss/Validation", val_loss, epoch)
+            writer.add_scalar("Accuracy/Validation", val_acc, epoch)
 
-            print("\n" + log_msg)
-            logger.info(log_msg)
-
-            # TensorBoard logs
-            writer.add_scalar("Loss/train", train_loss, epoch)
-            writer.add_scalar("Loss/val", val_loss, epoch)
-            writer.add_scalar("Accuracy/val", val_acc, epoch)
-            writer.add_scalar("F1/macro", metrics["macro_f1"], epoch)
-
-            # per-class metrics
-            for i in range(cfg.num_classes):
-                writer.add_scalar(f"F1/class_{i}", metrics["f1"][i], epoch)
-                writer.add_scalar(f"Sensitivity/class_{i}", metrics["sensitivity"][i], epoch)
-                writer.add_scalar(f"Specificity/class_{i}", metrics["specificity"][i], epoch)
-
-            # save best model
-            check_point_path = os.path.join(cfg.project_dir, "checkpoints", f"Experiment_{cfg.experiment_id}")
-            os.makedirs(check_point_path, exist_ok=True)
 
             if val_acc > best_acc:
                 best_acc = val_acc
-                torch.save(classifier.module.state_dict(), check_point_path + "/Epoch_" + str(epoch) + "_best_linear_probe.pth")
-                print("Saved best model")
+                #best_model_path = checkpoint_path + f"checkpoint_{epoch}.pth"
+
+                torch.save(classifier.module.state_dict(), best_model_path)
+
+                # Log best accuracy
+                writer.add_scalar("Accuracy/Best_Validation", best_acc, epoch)
+                print("Saved best model: ", epoch)
+
 
     # -------------------------
     # Test
     # -------------------------
-    test_acc, test_loss, test_cm, test_metrics = evaluate(
-        backbone,
-        classifier,
-        test_loader,
-        criterion,
-        device,
-        cfg.num_classes
+    dist.barrier()
+
+    classifier.module.load_state_dict(
+        torch.load(best_model_path, map_location=device)
     )
 
+    test_acc, test_loss, y_true, y_pred = evaluate_test_metrics(test_loader)
+
     if rank == 0:
-        print("\nFINAL TEST RESULTS")
-        print(f"ACC: {test_acc:.4f}")
-        print(f"Macro F1: {test_metrics['macro_f1']:.4f}")
+        #print(f"\nTEST ACC: {test_acc:.4f}")
+        cm = confusion_matrix(y_true, y_pred)
+        cm_df = pd.DataFrame(
+            cm,
+            index=class_names,
+            columns=class_names
+        )
 
-        logger.info(f"TEST_ACC={test_acc:.4f} TEST_F1={test_metrics['macro_f1']:.4f}")
+        print("\nConfusion Matrix:")
+        print(cm_df)
 
-        writer.add_scalar("Test/accuracy", test_acc)
-        writer.add_scalar("Test/macro_f1", test_metrics["macro_f1"])
+        precision, recall, f1, support = \
+            precision_recall_fscore_support(
+                y_true,
+                y_pred,
+                labels=np.arange(NUM_CLASSES),
+                zero_division=0
+            )
+
+        '''
+        print("\nClass-wise Metrics")
+        print("-" * 100)
+
+        for i, cls in enumerate(class_names):
+            print(
+                f"{cls:30s} | "
+                f"Recall(Sens): {recall[i]:.4f} | "
+                f"Precision: {precision[i]:.4f} | "
+                f"F1: {f1[i]:.4f} | "
+                f"N={support[i]}"
+            )
+        '''
+        if rank == 0:
+
+            print("\nClass-wise Sensitivity / Specificity / F1")
+            print("-" * 120)
+
+            for i, cls in enumerate(class_names):
+                TP = cm[i, i]
+
+                FN = cm[i, :].sum() - TP
+
+                FP = cm[:, i].sum() - TP
+
+                TN = cm.sum() - TP - FN - FP
+
+                sensitivity = TP / (TP + FN + 1e-12)
+
+                specificity = TN / (TN + FP + 1e-12)
+
+                f1_score = f1[i]
+
+                print(
+                    f"{cls:30s} | "
+                    f"Sens: {sensitivity:.4f} | "
+                    f"Spec: {specificity:.4f} | "
+                    f"F1: {f1_score:.4f}"
+                )
+
+        # TensorBoard logging
+        writer.add_scalar("Loss/Test", test_loss, EPOCHS)
+        writer.add_scalar("Accuracy/Test", test_acc, EPOCHS)
+
+        writer.flush()
+        writer.close()
+
 
     cleanup_ddp()
 
