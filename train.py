@@ -15,9 +15,14 @@ from transforms.transforms import get_transforms
 
 from models.backbones import build_backbone
 from models.feature_extractor import FeatureExtractor
-from models.probe import LinearProbe
+from models.probe import LinearProbe, MLPProbe
 
 from utils.metrics import compute_metrics
+from utils.metrics import save_confusion_matrix
+import pandas as pd
+from sklearn.decomposition import PCA
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 # ----------------------------------
@@ -29,6 +34,48 @@ def load_config(config_path):
         cfg = yaml.safe_load(f)
 
     return cfg
+
+
+
+def extract_features(feature_extractor, loader, device):
+
+    feature_extractor.backbone.eval()
+
+    all_feats = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for images, labels in loader:
+
+            images = images.to(device, non_blocking=True)
+
+            # ---- FEATURE EXTRACTION ----
+            if feature_extractor.backbone_name in ["vit", "vit_ssl"]:
+
+                x = feature_extractor.backbone._process_input(images)
+
+                cls_token = feature_extractor.backbone.class_token.expand(
+                    images.shape[0], -1, -1
+                )
+
+                x = torch.cat([cls_token, x], dim=1)
+
+                x = feature_extractor.backbone.encoder(x)
+
+                feats = x[:, 0]  # ✅ CLS token ONLY
+
+            else:
+
+                feats = feature_extractor(images)
+
+            all_feats.append(feats.cpu())
+            all_labels.append(labels.cpu())
+
+    feats = torch.cat(all_feats, dim=0).numpy()
+    labels = torch.cat(all_labels, dim=0).numpy()
+
+    return feats, labels
 
 
 # ----------------------------------
@@ -78,7 +125,9 @@ def main():
         train_loader,
         val_loader,
         test_loader,
-        train_sampler
+        train_sampler,
+        class_to_idx,
+        class_counts
     ) = build_dataloaders(
         cfg,
         transform
@@ -100,8 +149,8 @@ def main():
     # ----------------------------------
     # Probe
     # ----------------------------------
-    classifier = LinearProbe(
-        embed_dim,
+    classifier = MLPProbe(
+        embed_dim, # only when the cls and patch is of same dim
         cfg["classes"]["num_classes"]
     ).to(device)
 
@@ -110,14 +159,18 @@ def main():
         device_ids=[local_rank]
     )
 
+
     # ----------------------------------
     # Trainer
     # ----------------------------------
+    print("Calling trainer")
     trainer = Trainer(
         classifier=classifier,
         feature_extractor=feature_extractor,
         train_loader=train_loader,
         train_sampler=train_sampler,
+        class_to_idx=class_to_idx,
+        class_counts = class_counts,
         device=device,
         rank=rank,
         lr=cfg["training"]["lr"],
@@ -148,7 +201,7 @@ def main():
         writer = SummaryWriter(
             log_dir=cfg["output"]["tensorboard_dir"]
         )
-
+    
     # ----------------------------------
     # Checkpoint
     # ----------------------------------
@@ -161,7 +214,7 @@ def main():
         cfg["output"]["checkpoint_dir"],
         "best_model.pth"
     )
-
+    best_epoch = 0
     # ----------------------------------
     # Training Loop
     # ----------------------------------
@@ -215,7 +268,7 @@ def main():
             if val_acc > best_acc:
 
                 best_acc = val_acc
-
+                best_epoch = epoch
                 torch.save(
                     classifier.module.state_dict(),
                     best_model_path
@@ -242,7 +295,8 @@ def main():
             map_location=device
         )
     )
-
+    print("Loading best model at epoch {}".format(best_epoch))
+    
     # ----------------------------------
     # Test
     # ----------------------------------
@@ -255,9 +309,53 @@ def main():
         test_loader
     )
 
+
+
+    features, labels = extract_features(
+        feature_extractor,
+        test_loader,
+        device
+    )
+
+    pca = PCA(n_components=2)
+    proj = pca.fit_transform(features)
+
+    print(f"PCA explained variance: {pca.explained_variance_ratio_.sum():.4f}")
+
+    class_names = cfg["classes"]["names"]
+    num_classes = len(class_names)
+
+    plt.figure(figsize=(10, 8))
+
+    for c in range(num_classes):
+        idx = labels == c
+        plt.scatter(
+            proj[idx, 0],
+            proj[idx, 1],
+            label=class_names[c],
+            s=10,
+            alpha=0.7
+        )
+
+    plt.title("DINOv2 Feature PCA (Test Set)")
+    plt.xlabel("PC1")
+    plt.ylabel("PC2")
+    plt.legend()
+    plt.grid(True, alpha=0.2)
+
+    save_path = os.path.join(
+        cfg["output"]["plot_dir"],
+        "pca_test_features.png"
+    )
+
+    os.makedirs(cfg["output"]["plot_dir"], exist_ok=True)
+
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
     # ----------------------------------
     # Metrics
     # ----------------------------------
+
     if rank == 0:
 
         class_names = cfg["classes"]["names"]
@@ -268,25 +366,20 @@ def main():
             class_names
         )
 
+        save_confusion_matrix(
+            cm=cm,
+            class_names=class_names,
+            save_path=os.path.join(
+                cfg["output"]["cm_dir"],
+                "confusion_matrix.png"
+            ),
+            normalize=False
+        )
         print("\nTEST SET RESULTS (Best Model)")
-        print("=" * 80)
-
-        print("\nConfusion Matrix:\n")
-        print(cm_df.to_string())
         print("=" * 80)
 
         print("\nPer-class metrics:\n")
         print(df.to_string(index=False))
-
-
-        for m in class_metrics:
-
-            print(
-                f"{m['class']:30s} | "
-                f"Sens: {m['sensitivity']:.4f} | "
-                f"Spec: {m['specificity']:.4f} | "
-                f"F1: {m['f1']:.4f}"
-            )
 
         print("\nMacro Averages:")
         print("-" * 40)
@@ -310,7 +403,7 @@ def main():
 
         writer.flush()
         writer.close()
-
+  
     cleanup_ddp()
 
 

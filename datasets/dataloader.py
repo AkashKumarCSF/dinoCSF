@@ -1,15 +1,13 @@
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-
 from datasets.csf_dataset import build_csf_datasets
 
 
 def build_dataloaders(cfg, transform):
 
-    train_ds, val_ds, test_ds = build_csf_datasets(
+    train_ds, val_ds, test_ds, class_to_idx, class_counts  = build_csf_datasets(
         data_root=cfg["dataset"]["data_root"],
-        split_json_path=cfg["dataset"]["split_json"],
-        ods_file_path=cfg["dataset"]["ods_file"],
+        ods_file=cfg["dataset"]["ods_file"],
         transform=transform
     )
 
@@ -56,5 +54,7 @@ def build_dataloaders(cfg, transform):
         train_loader,
         val_loader,
         test_loader,
-        train_sampler
+        train_sampler,
+        class_to_idx,
+        class_counts
     )

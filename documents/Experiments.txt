@@ -1,0 +1,6 @@
+Experiment 1: MAE 50 epochs, linear probe - only cls no convergence
+Experiment 2: MAE 50 epochs, linear probe - cls + patch with weighted class no convergence val acc: 0.48
+Experiment 3: Dinov2 50 epochs, linear probe - cls + patch with weighted class no convergence vall acc: 0.70
+Experiment 4: Dinov2 50 epochs, 2 layer MLP + GELU, same as above parameters -- no convergence vall acc: 0.72
+Experiment 5: Dinov2 style ViT last 4 layers pre traing using CSF 
+Experiment 5: Ex5 + MLP probe

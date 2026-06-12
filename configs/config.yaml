@@ -4,25 +4,29 @@ experiment:
 dataset:
   name: CSF
 
-  data_root: "/home/adminuser/backup/Neuropathological_Data/projects/Akash/CSF_classification/raw_data/zenodo/"
+  data_root: "/home/administrator/Akash/datasets/CSF/"
   split_json: "data/split_file.json"
   ods_file: "data/supplementary_table_73.ods"
 
 model:
-  backbone: "dinov2"
+  backbone: "vit" # dinov2/mae
 
   dinov2:
     name: "dinov2_vitb14"
     embedding_dim: 768
+    pretrained_ssl_checkpoint: "ssl_checkpoints/best_model.pt"
 
   mae:
-    checkpoint: "/path/to/mae_pretrained.pth"
+    checkpoint: "data/mae_pretrain_vit_base.pth"
     embedding_dim: 768
 
+  vit:
+    checkpoint: "ssl_checkpoints/Experiment5/best_model.pt"
+
 training:
-  batch_size: 128
-  lr: 0.001
-  epochs: 100
+  batch_size: 32
+  lr: 0.0003 #0.001
+  epochs: 50
   weight_decay: 0.0001
 
 system:
@@ -32,6 +36,8 @@ system:
 output:
   checkpoint_dir: "checkpoints"
   tensorboard_dir: "tensorboard_logs"
+  cm_dir: "outputs/confusion_matrices"
+  plot_dir: "outputs/plots"
 
 data:
   img_size: 224

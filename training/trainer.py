@@ -10,6 +10,8 @@ class Trainer:
         feature_extractor,
         train_loader,
         train_sampler,
+        class_to_idx,
+        class_counts,
         device,
         rank,
         lr,
@@ -21,11 +23,25 @@ class Trainer:
 
         self.train_loader = train_loader
         self.train_sampler = train_sampler
-
+        self.class_to_idx = class_to_idx
+        self.class_counts = class_counts
         self.device = device
         self.rank = rank
 
-        self.criterion = torch.nn.CrossEntropyLoss()
+        counts = torch.tensor(
+            [self.class_counts[cls] for cls in self.class_to_idx.keys()],
+            dtype=torch.float32
+        )
+
+        # avoid divide-by-zero safety
+        counts = torch.clamp(counts, min=1.0)
+
+        weights = 1.0 / torch.log1p(counts)
+        weights = weights / weights.sum() * len(weights)
+
+        self.criterion = torch.nn.CrossEntropyLoss(
+            weight=weights.to(self.device)
+        )
 
         self.optimizer = torch.optim.AdamW(
             classifier.parameters(),

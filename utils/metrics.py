@@ -1,6 +1,43 @@
 import numpy as np
 import pandas as pd
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+def save_confusion_matrix(
+    cm,
+    class_names,
+    save_path,
+    normalize=False
+):
+
+    if normalize:
+        cm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+
+    plt.figure(figsize=(12, 10))
+
+    sns.heatmap(
+        cm,
+        cmap="Blues",
+        annot=True,
+        fmt="d",
+        xticklabels=class_names,
+        yticklabels=class_names,
+
+    )
+
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.title("Confusion Matrix")
+
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    plt.savefig(save_path, dpi=300, bbox_inches="tight")
+    plt.close()
 
 
 def compute_metrics(y_true, y_pred, class_names):
