@@ -14,7 +14,7 @@ model:
   dinov2:
     name: "dinov2_vitb14"
     embedding_dim: 768
-    pretrained_ssl_checkpoint: "ssl_checkpoints/best_model.pt"
+    pretrained_ssl_checkpoint: "ssl_checkpoints/Experiment6/best_model.pt"
 
   mae:
     checkpoint: "data/mae_pretrain_vit_base.pth"
@@ -26,7 +26,7 @@ model:
 training:
   batch_size: 32
   lr: 0.0003 #0.001
-  epochs: 50
+  epochs: 1
   weight_decay: 0.0001
 
 system:

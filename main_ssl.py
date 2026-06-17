@@ -1,12 +1,16 @@
 from training.train_ssl import train_ssl
 
 if __name__ == "__main__":
+    experiment_id = "Experiment6"
     best_model_path = train_ssl(
         dataset_path="/home/administrator/Akash/datasets/CSF/",
         epochs=300,
         batch_size=64,
         lr=1e-4,
-        save_dir="ssl_checkpoints"
+        save_dir=f"ssl_checkpoints/{experiment_id}/",
+        resume=False,
+        checkpoint_path=f"ssl_checkpoints/{experiment_id}",
+        log_dir=f"ssl_tensorboard/dino_ssl/{experiment_id}/"
     )
 
     print("Best model saved at:", best_model_path)

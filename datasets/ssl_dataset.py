@@ -11,13 +11,35 @@ class SSLImageFolder(Dataset):
                 if f.endswith(".png"):
                     self.paths.append(os.path.join(root, f))
 
-        self.transform = T.Compose([
-            T.Resize((image_size, image_size)),
-            T.RandomResizedCrop(image_size, scale=(0.6, 1.0)),
+        self.global_transform = T.Compose([
+            T.RandomResizedCrop(
+                224,
+                scale=(0.5, 1.0)
+            ),
             T.RandomHorizontalFlip(),
-            T.ColorJitter(0.2, 0.2, 0.2, 0.1),
-            T.RandomGrayscale(p=0.1),
-            T.GaussianBlur(kernel_size=5),
+            T.ColorJitter(
+                0.4,
+                0.4,
+                0.4,
+                0.1
+            ),
+            T.GaussianBlur(5),
+            T.ToTensor(),
+        ])
+
+        self.local_transform = T.Compose([
+            T.RandomResizedCrop(
+                112,
+                scale=(0.1, 0.4)
+            ),
+            T.RandomHorizontalFlip(),
+            T.ColorJitter(
+                0.4,
+                0.4,
+                0.4,
+                0.1
+            ),
+            T.GaussianBlur(5),
             T.ToTensor(),
         ])
 
@@ -27,8 +49,19 @@ class SSLImageFolder(Dataset):
     def __getitem__(self, idx):
         img = Image.open(self.paths[idx]).convert("RGB")
 
-        # two augmented views (DINO-style)
-        x1 = self.transform(img)
-        x2 = self.transform(img)
+        global1 = self.global_transform(img)
+        global2 = self.global_transform(img)
 
-        return x1, x2
+        local1 = self.local_transform(img)
+        local2 = self.local_transform(img)
+        local3 = self.local_transform(img)
+        local4 = self.local_transform(img)
+
+        return [
+            global1,
+            global2,
+            local1,
+            local2,
+            local3,
+            local4
+        ]

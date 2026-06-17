@@ -13,9 +13,11 @@ class DINOStudent(nn.Module):
         )
         #self.backbone.heads = nn.Identity()
         self.projector = nn.Sequential(
-            nn.Linear(768, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256)
+            nn.Linear(768, 2048),
+            nn.GELU(),
+            nn.Linear(2048, 2048),
+            nn.GELU(),
+            nn.Linear(2048, 256)
         )
 
     def forward(self, x):
@@ -33,7 +35,7 @@ class DINOTeacher(nn.Module):
             p.requires_grad = False
 
     @torch.no_grad()
-    def update(self, student, momentum=0.996):
+    def update(self, student, momentum=0.999):
         for ps, pt in zip(student.parameters(), self.teacher.parameters()):
             pt.data = pt.data * momentum + ps.data * (1 - momentum)
 
