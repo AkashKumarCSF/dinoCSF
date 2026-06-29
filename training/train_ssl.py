@@ -33,15 +33,6 @@ def dino_loss(
     temp_t=0.04
 ):
 
-    student_out = F.normalize(
-        student_out,
-        dim=-1
-    )
-
-    teacher_out = F.normalize(
-        teacher_out,
-        dim=-1
-    )
 
     student_logits = student_out / temp_s
 
@@ -153,6 +144,37 @@ def inspect(model):
             break
 
 
+def teacher_temperature(
+    epoch,
+    warmup_epochs=30,
+    start_temp=0.04,
+    final_temp=0.07,
+):
+    if epoch >= warmup_epochs:
+        return final_temp
+
+    alpha = epoch / warmup_epochs
+
+    return (
+        start_temp
+        + alpha * (final_temp - start_temp)
+    )
+
+
+import math
+
+def cosine_teacher_momentum(
+    current_step,
+    total_steps,
+    base=0.996,
+    final=1.0,
+):
+    return final - (final - base) * (
+        (math.cos(math.pi * current_step / total_steps) + 1)
+        / 2
+    )
+
+
 def train_ssl(
     dataset_path,
     epochs=50,
@@ -182,6 +204,11 @@ def train_ssl(
         filter(lambda p: p.requires_grad, student.parameters()),
         lr=lr,
         weight_decay=0.04
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=epochs,
+        eta_min=1e-6,
     )
 
     start_epoch = 0
@@ -215,17 +242,28 @@ def train_ssl(
 
         print(f"\nResuming training from epoch {start_epoch + 1}")
 
+    total_steps = epochs * len(loader)
+    global_step = start_epoch * len(loader)
 
-    #print("\n=== STUDENT MODEL ===")
-    #print(student)
     scaler = torch.cuda.amp.GradScaler()
 
     for epoch in range(start_epoch, epochs):
 
+        current_teacher_temp = teacher_temperature(epoch)
         student.train()
         teacher.teacher.eval()
 
         total_loss = 0
+        wd_start = 0.04
+        wd_end = 0.4
+
+        weight_decay = wd_end - (
+                wd_end - wd_start
+        ) * ((math.cos(math.pi * epoch / epochs) + 1)/ 2)
+
+        for group in optimizer.param_groups:
+            group["weight_decay"] = weight_decay
+
         start_epoch = time.time()
 
         loader_tqdm = tqdm(loader, desc=f"Epoch {epoch + 1}/{epochs}")
@@ -236,10 +274,15 @@ def train_ssl(
 
             views = [v.cuda(non_blocking=True) for v in views]
 
+            '''
             global_views = views[:2]
             local_views = views[2:]
             student_views = views  # all crops
+            '''
+            # Using only 2 global views and not local views!
 
+            global_views = views
+            student_views = views
             # -------------------------
             # TEACHER FORWARD (NO GRAD)
             # -------------------------
@@ -263,7 +306,9 @@ def train_ssl(
                         loss += dino_loss(
                             s,
                             t,
-                            centering.center
+                            centering.center,
+                            temp_s=0.1,
+                            temp_t=current_teacher_temp,
                         )
                         n_terms += 1
 
@@ -274,14 +319,35 @@ def train_ssl(
             # -------------------------
             optimizer.zero_grad()
 
+            optimizer.zero_grad()
+
             scaler.scale(loss).backward()
+
+            # Needed before clipping with AMP
+            scaler.unscale_(optimizer)
+
+            torch.nn.utils.clip_grad_norm_(
+                student.parameters(),
+                max_norm=3.0,
+            )
+
             scaler.step(optimizer)
             scaler.update()
 
             # -------------------------
             # EMA UPDATE
             # -------------------------
-            teacher.update(student)
+            m = cosine_teacher_momentum(
+                global_step,
+                total_steps,
+            )
+
+            teacher.update(
+                student,
+                momentum=m,
+            )
+
+            global_step += 1
 
             total_loss += loss.item()
 
@@ -291,6 +357,7 @@ def train_ssl(
             })
 
         avg_loss = total_loss / len(loader)
+        scheduler.step()
 
         epoch_time = time.time() - start_epoch
 
@@ -311,7 +378,7 @@ def train_ssl(
         #print(f"Epoch [{epoch+1}/{epochs}] Loss: {avg_loss:.4f}")
 
         writer.add_scalar("Loss/train", avg_loss, epoch)
-        if (epoch + 1) % 15 == 0:
+        if (epoch + 1) % 5 == 0:
             torch.save(
                 {
                     "epoch": epoch + 1,

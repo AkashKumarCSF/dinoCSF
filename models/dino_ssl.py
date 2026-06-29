@@ -13,16 +13,32 @@ class DINOStudent(nn.Module):
         )
         #self.backbone.heads = nn.Identity()
         self.projector = nn.Sequential(
-            nn.Linear(768, 2048),
+            nn.Linear(768, 2048, bias=False),
             nn.GELU(),
-            nn.Linear(2048, 2048),
+            nn.Linear(2048, 2048, bias=False),
             nn.GELU(),
-            nn.Linear(2048, 256)
+            nn.Linear(2048, 256, bias=False),
         )
+
+        # Weight-normalized last layer (same idea as DINO)
+        self.last_layer = nn.utils.weight_norm(
+            nn.Linear(256, 256, bias=False)
+        )
+
+        # Initialize scale to 1
+        self.last_layer.weight_g.data.fill_(1.0)
+        self.last_layer.weight_g.requires_grad = False
 
     def forward(self, x):
         features = self.backbone(x)
-        return self.projector(features)
+
+        x = self.projector(features)
+
+        x = F.normalize(x, dim=-1)
+
+        x = self.last_layer(x)
+
+        return x
 
 
 class DINOTeacher(nn.Module):
